@@ -9,8 +9,11 @@ class TTLockClient {
  public:
   void begin();
   bool unlock(const LockConfig& lock, String& error);
-  // V7.1 queue retry: run one recovery-mode attempt only.
+  // V7.6 queue retry: run one recovery-mode attempt only.
   bool unlockRecoveryOnly(const LockConfig& lock, String& error);
+  // V7.8 burst mode: successful unlocks leave scanning paused so the worker
+  // can hand the BLE radio directly to the next queued lock.
+  void resumeGatewayScanner();
   // Factory-reset V3 lock provisioning. The returned LockConfig contains the
   // lock-generated AES key and locally generated unlock/admin secrets.
   bool initializeNewLock(LockConfig& lock, String& error);

@@ -17,7 +17,7 @@ static BundleCrypto* bundleCrypto = nullptr;
 static WebPortal* portal = nullptr;
 
 static void unlockWorker(void*) {
-  Serial.println("[BLE-WORKER] single radio owner ready (V7.1 end-of-queue retry enabled)");
+  Serial.println("[BLE-WORKER] single radio owner ready (V7.9 reliable burst queue + clock preflight + multi-round recovery)");
   UnlockJob job;
   while (true) {
     if (xQueueReceive(unlockQueue, &job, portMAX_DELAY) != pdTRUE) continue;
@@ -45,40 +45,59 @@ static void unlockWorker(void*) {
                     : ttlock.unlock(job.lock, error);
       const uint32_t unlockFinished = millis();
 
-      // V7.1: if the normal V7 two-attempt sequence failed, release the radio
-      // and put this lock at the END of the queue once. This lets another lock
-      // run immediately and naturally gives the failed lock time to settle.
-      if (!ok && !deferredAttempt &&
-          job.deferredRetries < AppConfig::MAX_DEFERRED_UNLOCK_RETRIES) {
+      // V7.9 reliability queue: any failed round may be deferred again up to
+      // MAX_DEFERRED_UNLOCK_RETRIES. This includes a lock-level 0x47 rejection:
+      // BLE worked, but the request was not accepted, so do not silently drop it.
+      if (!ok && job.deferredRetries < AppConfig::MAX_DEFERRED_UNLOCK_RETRIES) {
         job.deferredRetries++;
         const UBaseType_t waiting = uxQueueMessagesWaiting(unlockQueue);
+        const bool clockNotReady = error.indexOf("system clock") >= 0 ||
+                                   error.indexOf("SNTP") >= 0;
         xSemaphoreGive(bleMutex);
 
-        if (waiting == 0) {
-          Serial.printf("[BLE-WORKER][%08lX] no other lock waiting; cooldown %lu ms before final retry\n",
-                        (unsigned long)job.requestId,
-                        (unsigned long)AppConfig::DEFERRED_RETRY_IDLE_COOLDOWN_MS);
-          delay(AppConfig::DEFERRED_RETRY_IDLE_COOLDOWN_MS);
-        } else {
-          Serial.printf("[BLE-WORKER][%08lX] unlock failed; moving to END of queue behind %u waiting job(s)\n",
-                        (unsigned long)job.requestId, (unsigned)waiting);
-        }
+        const uint32_t backoff = clockNotReady
+            ? AppConfig::CLOCK_RETRY_BACKOFF_MS
+            : (waiting == 0 ? AppConfig::DEFERRED_RETRY_IDLE_COOLDOWN_MS
+                            : AppConfig::DEFERRED_RETRY_BACKOFF_MS);
+
+        Serial.printf("[BLE-WORKER][%08lX][RELIABLE] attempt round failed (%u/%u): %s; "
+                      "requeue at END after %lu ms; %u other job(s) waiting\n",
+                      (unsigned long)job.requestId,
+                      (unsigned)job.deferredRetries,
+                      (unsigned)AppConfig::MAX_DEFERRED_UNLOCK_RETRIES,
+                      error.c_str(), (unsigned long)backoff, (unsigned)waiting);
+
+        // Give the lock/radio (or SNTP) time to settle. Other requests are
+        // already queued ahead of this job and will retain FIFO order.
+        if (backoff) delay(backoff);
 
         job.enqueuedAtMs = millis();
-        if (xQueueSend(unlockQueue, &job, 0) == pdTRUE) {
-          Serial.printf("[BLE-WORKER][%08lX] deferred retry queued depth=%u\n",
+        if (xQueueSend(unlockQueue, &job, pdMS_TO_TICKS(250)) == pdTRUE) {
+          Serial.printf("[BLE-WORKER][%08lX][RELIABLE] retry queued depth=%u\n",
                         (unsigned long)job.requestId,
                         (unsigned)uxQueueMessagesWaiting(unlockQueue));
           Util::secureZero(&job, sizeof(job));
           continue;
         }
 
-        // Queue may have filled while this BLE operation was running. Do not
-        // spin or retry forever; report the original unlock as failed.
-        Serial.printf("[BLE-WORKER][%08lX] deferred requeue FAILED: queue full\n",
+        Serial.printf("[BLE-WORKER][%08lX][RELIABLE] retry requeue FAILED: queue full\n",
                       (unsigned long)job.requestId);
       } else {
         xSemaphoreGive(bleMutex);
+      }
+
+      // V7.8 burst handoff: a successful unlock intentionally leaves the
+      // scanner paused. If another unlock is already queued, let the next job
+      // take the radio immediately using its cached sighting/GATT state. Only
+      // resume continuous scanning when the burst has drained.
+      if (ok) {
+        const UBaseType_t waitingNow = uxQueueMessagesWaiting(unlockQueue);
+        if (waitingNow > 0) {
+          Serial.printf("[BLE-WORKER][%08lX][BURST] %u queued job(s); direct handoff, scanner stays paused\n",
+                        (unsigned long)job.requestId, (unsigned)waitingNow);
+        } else {
+          ttlock.resumeGatewayScanner();
+        }
       }
 
       Serial.printf("Unlock %s: %s%s%s\n", job.lock.name, ok ? "SUCCESS" : "FAILED",

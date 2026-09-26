@@ -20,30 +20,110 @@ void logProtocolEvent(const char* direction, uint8_t command, size_t frameLen, c
   Serial.println();
 }
 
-// Unlock-only scan callback. It stops the controller scan on the first
-// advertisement from the requested MAC instead of always paying the full
-// target-scan timeout. NimBLE keeps the advertised-device object in the scan
-// result list, so it remains valid long enough to initiate the connection.
-class TargetScanCallbacks final : public NimBLEScanCallbacks {
- public:
-  explicit TargetScanCallbacks(const NimBLEAddress& target) : target_(target) {}
+// V7.7 scanner: this intentionally mirrors the diagnostic firmware that
+// reliably sees both 5A01 locks every ~900 ms.  The important details are
+// onResult() + duplicate callbacks + active 100/100 scanning + maxResults(0).
+// We do not retain NimBLEAdvertisedDevice pointers; only plain sighting data.
+struct LockSighting {
+  char mac[18]{};
+  uint32_t seenAtMs{0};
+  int rssi{-127};
+  uint8_t addressType{BLE_ADDR_PUBLIC};
+  uint32_t count{0};
+  char name[40]{};
+  uint8_t protocolType{0};
+  uint8_t protocolVersion{0};
+};
 
-  void onDiscovered(const NimBLEAdvertisedDevice* device) override {
-    if (device && device->getAddress() == target_) {
-      found_ = device;
-      foundAtMs_ = millis();
-      NimBLEDevice::getScan()->stop();
+constexpr size_t MAX_SIGHTINGS = 16;
+LockSighting gSightings[MAX_SIGHTINGS];
+portMUX_TYPE gSightingsMux = portMUX_INITIALIZER_UNLOCKED;
+
+static bool sameMac(const char* a, const char* b) {
+  if (!a || !b) return false;
+  return strcasecmp(a, b) == 0;
+}
+
+class GatewayScanCallbacks final : public NimBLEScanCallbacks {
+ public:
+  void onResult(const NimBLEAdvertisedDevice* device) override {
+    if (!device) return;
+    NimBLEUUID ttService("00001910-0000-1000-8000-00805f9b34fb");
+    if (!device->isAdvertisingService(ttService)) return;
+
+    const std::string mac = device->getAddress().toString();
+    const uint32_t now = millis();
+    portENTER_CRITICAL(&gSightingsMux);
+    size_t slot = MAX_SIGHTINGS;
+    size_t oldest = 0;
+    uint32_t oldestAt = UINT32_MAX;
+    for (size_t i = 0; i < MAX_SIGHTINGS; ++i) {
+      if (gSightings[i].mac[0] && sameMac(gSightings[i].mac, mac.c_str())) {
+        slot = i;
+        break;
+      }
+      if (!gSightings[i].mac[0] && slot == MAX_SIGHTINGS) slot = i;
+      if (gSightings[i].seenAtMs < oldestAt) {
+        oldestAt = gSightings[i].seenAtMs;
+        oldest = i;
+      }
+    }
+    if (slot == MAX_SIGHTINGS) slot = oldest;
+    strlcpy(gSightings[slot].mac, mac.c_str(), sizeof(gSightings[slot].mac));
+    gSightings[slot].seenAtMs = now;
+    gSightings[slot].rssi = device->getRSSI();
+    gSightings[slot].addressType = device->getAddress().getType();
+    gSightings[slot].count++;
+    if (device->haveName()) {
+      strlcpy(gSightings[slot].name, device->getName().c_str(), sizeof(gSightings[slot].name));
+    }
+    if (device->haveManufacturerData()) {
+      const std::string m = device->getManufacturerData();
+      if (m.size() >= 2) {
+        gSightings[slot].protocolType = static_cast<uint8_t>(m[0]);
+        gSightings[slot].protocolVersion = static_cast<uint8_t>(m[1]);
+      }
+    }
+    portEXIT_CRITICAL(&gSightingsMux);
+  }
+};
+
+GatewayScanCallbacks gGatewayScanCallbacks;
+
+static void startGatewayScanner() {
+  NimBLEScan* scan = NimBLEDevice::getScan();
+  if (scan->isScanning()) return;
+  scan->setScanCallbacks(&gGatewayScanCallbacks, true); // duplicates are REQUIRED
+  scan->setActiveScan(true);
+  scan->setInterval(100);
+  scan->setWindow(100);
+  scan->setMaxResults(0); // callback driven, same as diagnostic firmware
+  scan->start(0, false, true);
+}
+
+static bool getSighting(const char* mac, LockSighting& out) {
+  bool found = false;
+  portENTER_CRITICAL(&gSightingsMux);
+  for (const auto& s : gSightings) {
+    if (s.mac[0] && sameMac(s.mac, mac)) {
+      out = s;
+      found = true;
+      break;
     }
   }
+  portEXIT_CRITICAL(&gSightingsMux);
+  return found;
+}
 
-  const NimBLEAdvertisedDevice* found() const { return found_; }
-  uint32_t foundAtMs() const { return foundAtMs_; }
+static bool waitForFreshSighting(const char* mac, uint32_t timeoutMs, LockSighting& out) {
+  const uint32_t started = millis();
+  while (millis() - started < timeoutMs) {
+    if (getSighting(mac, out) && millis() - out.seenAtMs <= AppConfig::BLE_SIGHTING_MAX_AGE_MS) return true;
+    delay(5);
+  }
+  return getSighting(mac, out) && millis() - out.seenAtMs <= AppConfig::BLE_SIGHTING_MAX_AGE_MS;
+}
 
- private:
-  NimBLEAddress target_;
-  const NimBLEAdvertisedDevice* found_{nullptr};
-  uint32_t foundAtMs_{0};
-};
 }
 
 TTLockProtocolFamily TTLockClient::protocolFamily(const LockConfig& lock) {
@@ -146,57 +226,37 @@ void TTLockClient::begin() {
   if (!responseSem_) responseSem_ = xSemaphoreCreateBinary();
   NimBLEDevice::init("TTLock-Bridge");
   NimBLEDevice::setPower(AppConfig::BLE_TX_POWER_DBM);
-  auto* scan = NimBLEDevice::getScan();
-  scan->setActiveScan(true);
-  scan->setInterval(100);
-  scan->setWindow(100);
-  scan->setMaxResults(40);
+  startGatewayScanner();
 }
 
 std::vector<BleScanItem> TTLockClient::scan(uint32_t durationMs) {
+  // V7.6 uses the always-on callback scanner. Give it the requested observation
+  // window, then return TTLock sightings from the cache rather than NimBLE's
+  // retained result list (maxResults is intentionally zero).
+  startGatewayScanner();
+  const uint32_t started = millis();
+  while (millis() - started < durationMs) delay(10);
+
   std::vector<BleScanItem> out;
-  NimBLEScan* scanner = NimBLEDevice::getScan();
-  NimBLEScanResults results = scanner->getResults(durationMs, false);
-  NimBLEUUID ttService("00001910-0000-1000-8000-00805f9b34fb");
-  NimBLEUUID bongService("6e400001-b5a3-f393-e0a9-e50e24dcca1e");
-  for (int i = 0; i < results.getCount() && out.size() < 20; ++i) {
-    const NimBLEAdvertisedDevice* d = results.getDevice(i);
-    if (!d) continue;
-    bool ttGatt = d->isAdvertisingService(ttService);
-    bool uartGatt = d->isAdvertisingService(bongService);
-    bool likely = ttGatt || uartGatt;
-    String name = d->getName().c_str();
-    String upper = name; upper.toUpperCase();
-    // 5A01-family locks do not always advertise 0x1910 while asleep. Keep
-    // lock-like names and 5A01 visible so an installer can select them.
-    if (!likely && upper.indexOf("LOCK") < 0 && upper.indexOf("TT") < 0 &&
-        upper.indexOf("5A01") < 0) continue;
+  portENTER_CRITICAL(&gSightingsMux);
+  for (const auto& s : gSightings) {
+    if (!s.mac[0] || out.size() >= 20) continue;
     BleScanItem item;
-    strlcpy(item.name, name.length() ? name.c_str() : "TTLock", sizeof(item.name));
-    String mac = d->getAddress().toString().c_str(); mac.toUpperCase();
+    strlcpy(item.name, s.name[0] ? s.name : "TTLock", sizeof(item.name));
+    String mac(s.mac); mac.toUpperCase();
     strlcpy(item.mac, mac.c_str(), sizeof(item.mac));
-    item.rssi = d->getRSSI();
-    item.ttlockService = ttGatt;
-    item.uartService = uartGatt;
-
-    // TTLock advertisements expose protocol type/version as the first two
-    // manufacturer-data bytes. Example 5A01 V3: 05 03 ...
-    if (d->haveManufacturerData()) {
-      std::string manufacturer = d->getManufacturerData();
-      if (manufacturer.size() >= 2) {
-        const uint8_t type = static_cast<uint8_t>(manufacturer[0]);
-        const uint8_t version = static_cast<uint8_t>(manufacturer[1]);
-        if (type == 5 && (version == 1 || version == 3 || version == 4)) {
-          item.protocolType = type;
-          item.protocolVersion = version;
-          item.protocolDetected = true;
-        }
-      }
+    item.rssi = s.rssi;
+    item.ttlockService = true;
+    item.uartService = false;
+    if (s.protocolType == 5 &&
+        (s.protocolVersion == 1 || s.protocolVersion == 3 || s.protocolVersion == 4)) {
+      item.protocolType = s.protocolType;
+      item.protocolVersion = s.protocolVersion;
+      item.protocolDetected = true;
     }
-
     out.push_back(item);
   }
-  scanner->clearResults();
+  portEXIT_CRITICAL(&gSightingsMux);
   return out;
 }
 
@@ -212,6 +272,14 @@ const NimBLEAdvertisedDevice* TTLockClient::findDevice(const char* mac, NimBLESc
 }
 
 bool TTLockClient::unlock(const LockConfig& lock, String& error) {
+  // V7.9 preflight: an unlock frame requires real Unix time. Do not connect to
+  // the lock and burn BLE retries while SNTP is still synchronizing.
+  if (time(nullptr) < 1577836800) {
+    error = "ESP system clock is not set; waiting for SNTP before unlocking";
+    Serial.println("[TTLock][V7.9][CLOCK] time not ready; BLE attempt deferred");
+    return false;
+  }
+
   const uint32_t allAttemptsStarted = millis();
   for (uint8_t attempt = 1; attempt <= AppConfig::UNLOCK_ATTEMPTS; ++attempt) {
     const uint32_t attemptStarted = millis();
@@ -250,12 +318,20 @@ bool TTLockClient::unlock(const LockConfig& lock, String& error) {
 }
 
 bool TTLockClient::unlockRecoveryOnly(const LockConfig& lock, String& error) {
+  // Same preflight for deferred retries. The worker will put the request back
+  // at the end of the queue instead of consuming a BLE attempt.
+  if (time(nullptr) < 1577836800) {
+    error = "ESP system clock is not set; waiting for SNTP before unlocking";
+    Serial.println("[TTLock][V7.9][CLOCK] time not ready; deferred retry stays queued");
+    return false;
+  }
+
   const uint32_t started = millis();
-  Serial.println("[TTLock][V7.1] deferred queue retry: recovery-only attempt");
+  Serial.println("[TTLock][V7.9] deferred queue retry");
   String localError;
   const bool ok = unlockAttempt(lock, localError, true);
   if (!ok) error = localError;
-  Serial.printf("[TTLock][V7.1] deferred recovery %s duration=%lu ms%s%s\n",
+  Serial.printf("[TTLock][V7.9] deferred recovery %s duration=%lu ms%s%s\n",
                 ok ? "SUCCESS" : "FAILED",
                 (unsigned long)(millis() - started),
                 ok ? "" : " error=", ok ? "" : localError.c_str());
@@ -281,10 +357,17 @@ bool TTLockClient::initializeAttempt(LockConfig& lock, String& error) {
   }
 
   NimBLEScan* scanner = NimBLEDevice::getScan();
+  if (scanner->isScanning()) scanner->stop();
+  scanner->setScanCallbacks(nullptr, false);
+  scanner->setMaxResults(40);
+  scanner->setActiveScan(true);
+  scanner->setInterval(100);
+  scanner->setWindow(100);
   NimBLEScanResults results = scanner->getResults(AppConfig::BLE_SCAN_TIMEOUT_MS, false);
   const NimBLEAdvertisedDevice* device = findDevice(lock.mac, results);
   if (!device) {
     scanner->clearResults();
+    startGatewayScanner();
     error = "Factory-reset lock not found. Wake/touch it immediately before initialization.";
     return false;
   }
@@ -292,6 +375,7 @@ bool TTLockClient::initializeAttempt(LockConfig& lock, String& error) {
   NimBLEClient* client = NimBLEDevice::createClient();
   if (!client) {
     scanner->clearResults();
+    startGatewayScanner();
     error = "Could not create BLE client";
     return false;
   }
@@ -300,6 +384,7 @@ bool TTLockClient::initializeAttempt(LockConfig& lock, String& error) {
   scanner->clearResults();
   if (!connected) {
     NimBLEDevice::deleteClient(client);
+    startGatewayScanner();
     error = "BLE connect failed";
     return false;
   }
@@ -409,6 +494,7 @@ bool TTLockClient::initializeAttempt(LockConfig& lock, String& error) {
     Util::secureZero(lock.unlockKey, sizeof(lock.unlockKey));
     lock.adminPs = 0;
   }
+  startGatewayScanner();
   return success;
 }
 
@@ -463,12 +549,12 @@ bool TTLockClient::unlockV3Attempt(const LockConfig& lock, String& error, bool r
   }
   // v7: NimBLE-Arduino defaults to 2 automatic retries after HCI 0x3e. Those
   // retries can hold the single BLE worker for >6 seconds. Disable them and
-  // let our explicit attempt-2 recovery scan/reconnect policy handle failure.
+  // let our explicit attempt-2 retry policy handle failure.
   client->setConnectRetries(0);
   client->setConnectTimeout(recoveryScan
                                 ? AppConfig::BLE_RECOVERY_CONNECT_TIMEOUT_MS
                                 : AppConfig::BLE_FAST_CONNECT_TIMEOUT_MS);
-  Serial.printf("[TTLock][V7] connect policy: retries=0 timeout=%lu ms mode=%s\n",
+  Serial.printf("[TTLock][V7.7] connect policy: retries=0 timeout=%lu ms mode=%s\n",
                 (unsigned long)(recoveryScan
                                     ? AppConfig::BLE_RECOVERY_CONNECT_TIMEOUT_MS
                                     : AppConfig::BLE_FAST_CONNECT_TIMEOUT_MS),
@@ -484,61 +570,34 @@ bool TTLockClient::unlockV3Attempt(const LockConfig& lock, String& error, bool r
   Serial.printf("[TTLock][CACHE] %s for %s; shared profile=TTLock-V3-1910/FFF2/FFF4\n",
                 gattCacheHit ? "GATT cache HIT" : "GATT cache MISS", lock.mac);
 
-  // v6 fast path: the first attempt connects directly to the configured MAC.
-  // A foreground scan adds ~350 ms to every normal unlock and is not required
-  // by the TTLock protocol. Only retries use the short targeted scan as a
-  // recovery aid after a failed direct connection.
-  NimBLEScan* fastScanner = NimBLEDevice::getScan();
-  const NimBLEAdvertisedDevice* freshAdv = nullptr;
-  TargetScanCallbacks* targetCallbacks = nullptr;
-
-  if (recoveryScan) {
-    Serial.println("[TTLock][V7] recovery attempt: short targeted scan before reconnect");
-    timingMark = millis();
-    const uint32_t scanStartedAt = timingMark;
-    targetCallbacks = new TargetScanCallbacks(address);
-    fastScanner->clearResults();
-    fastScanner->setScanCallbacks(targetCallbacks, false);
-    fastScanner->setActiveScan(false);
-    fastScanner->setInterval(30);
-    fastScanner->setWindow(30);
-    fastScanner->start(AppConfig::BLE_FAST_TARGET_SCAN_MS, false, true);
-    while (fastScanner->isScanning() &&
-           millis() - scanStartedAt < AppConfig::BLE_FAST_TARGET_SCAN_MS + 25) {
-      delay(1);
-    }
-    if (fastScanner->isScanning()) fastScanner->stop();
-    freshAdv = targetCallbacks->found();
-    timing(freshAdv ? "recovery scan EARLY HIT" : "recovery scan MISS");
-    if (freshAdv) {
-      Serial.printf("[TTLock][CONNECT] recovery target seen after %lu ms RSSI=%d\n",
-                    (unsigned long)(targetCallbacks->foundAtMs() - scanStartedAt),
-                    freshAdv->getRSSI());
-    }
-  } else {
-    Serial.println("[TTLock][V7] fast path: skip foreground scan; direct-MAC connect");
+  // V7.7: synchronize the connection with the scanner configuration that was
+  // proven to see these locks.  The diagnostic showed both configured 5A01
+  // locks (public address type 0) roughly every 900 ms.  Accept a sighting no
+  // older than 10 s. If no usable sighting exists, wait briefly for the next onResult().
+  NimBLEScan* gatewayScanner = NimBLEDevice::getScan();
+  startGatewayScanner();
+  timingMark = millis();
+  LockSighting sighting;
+  const bool seen = waitForFreshSighting(lock.mac, AppConfig::BLE_SIGHTING_WAIT_MS, sighting);
+  timing(seen ? "fresh 1910 sighting" : "1910 sighting TIMEOUT");
+  if (!seen) {
+    if (!gattCacheHit) NimBLEDevice::deleteClient(client);
+    error = "TTLock 0x1910 advertisement not seen";
+    return false;
   }
+  Serial.printf("[TTLock][V7.7][ADV] %s seen age=%lu ms RSSI=%d addrType=%u count=%lu\n",
+                lock.mac, (unsigned long)(millis() - sighting.seenAtMs), sighting.rssi,
+                (unsigned)sighting.addressType, (unsigned long)sighting.count);
+
+  // Stop the same scanner cleanly before GAP connection.  We deliberately do
+  // not retain a NimBLEAdvertisedDevice pointer across this transition.
+  timingMark = millis();
+  if (gatewayScanner->isScanning()) gatewayScanner->stop();
+  timing("stop continuous scanner");
 
   timingMark = millis();
-  bool connected = false;
-  if (freshAdv) {
-    connected = client->connect(freshAdv, false, false, true);
-    timing("BLE connect after recovery ADV");
-  } else {
-    connected = client->connect(address, false, false, true);
-    timing(recoveryScan ? "direct connect after scan" : "direct BLE connect");
-  }
-
-  if (recoveryScan) {
-    // Do not leave a stack callback installed. Clear scan results only after
-    // connect() has finished because freshAdv belongs to the scanner.
-    fastScanner->clearResults();
-    fastScanner->setScanCallbacks(nullptr, false);
-    fastScanner->setActiveScan(true);
-    fastScanner->setInterval(100);
-    fastScanner->setWindow(100);
-    delete targetCallbacks;
-  }
+  bool connected = client->connect(address, false, false, true);
+  timing("BLE connect after sighting");
 
   if (!connected) {
     // Keep a previously discovered GATT cache across ordinary GAP connection
@@ -551,7 +610,8 @@ bool TTLockClient::unlockV3Attempt(const LockConfig& lock, String& error, bool r
     } else {
       Serial.println("[TTLock][CACHE] connect failed; preserving existing GATT cache for retry");
     }
-    error = recoveryScan ? "BLE reconnect failed after recovery scan" : "Direct BLE connect failed";
+    error = "BLE connect failed after fresh 0x1910 sighting";
+    startGatewayScanner();
     return false;
   }
 
@@ -676,7 +736,18 @@ bool TTLockClient::unlockV3Attempt(const LockConfig& lock, String& error, bool r
                 (unsigned long)(millis() - unlockStarted),
                 success ? "" : " error=",
                 success ? "" : error.c_str());
+  if (!success) {
+    startGatewayScanner();
+    Serial.println("[TTLock][V7.8][SCAN] scanner resumed after failed attempt");
+  } else {
+    Serial.println("[TTLock][V7.8][BURST] unlock complete; scanner remains paused for worker handoff");
+  }
   return success;
+}
+
+void TTLockClient::resumeGatewayScanner() {
+  startGatewayScanner();
+  Serial.println("[TTLock][V7.8][SCAN] continuous scanner resumed (queue drained)");
 }
 
 void TTLockClient::notifyCallback(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {
