@@ -9,7 +9,7 @@ class TTLockClient {
  public:
   void begin();
   bool unlock(const LockConfig& lock, String& error);
-  // V7.1 queue retry: run one recovery-mode attempt only.
+  // V7.6 queue retry: run one recovery-mode attempt only.
   bool unlockRecoveryOnly(const LockConfig& lock, String& error);
   // Factory-reset V3 lock provisioning. The returned LockConfig contains the
   // lock-generated AES key and locally generated unlock/admin secrets.

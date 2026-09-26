@@ -1,3 +1,14 @@
+
+## v6 unlock latency optimization
+
+The normal unlock path now uses **direct-MAC connect first**. It no longer spends ~350 ms on a foreground scan before every attempt. If the direct connection fails, attempt 2 performs the short targeted scan as a recovery mechanism and then reconnects. Existing discovered GATT attributes are preserved across ordinary connection-establishment failures; empty/new client objects are discarded before retry. The bridge intentionally keeps a single BLE radio owner because overlapping ESP32-C3/NimBLE connection procedures proved unsafe. Separate webhook requests are still accepted and queued independently.
+
+Expected serial markers:
+
+- `[TTLock][V6] fast path: skip foreground scan; direct-MAC connect`
+- `[TTLock][V6] recovery attempt: short targeted scan before reconnect`
+- `[TTLock][CACHE] connect failed; preserving existing GATT cache for retry`
+
 # UniFi Access → TTLock local bridge (Arduino / ESP32)
 
 A local ESP32 bridge intended for a PoE/Ethernet installation. UniFi Access remains the access-control authority. For each door, UniFi Alarm Manager/Webhooks stores an **encrypted TTLock context**. When the door webhook fires, the ESP decrypts that context in RAM, queues a BLE job, connects to the cylinder, performs the TTLock V3 unlock handshake, and immediately disconnects.
@@ -64,17 +75,17 @@ The portal supports BLE scanning to pre-fill the lock MAC/name. Enter:
 
 ```json
 {
-	"id": "front-door",
-	"name": "Front Door",
-	"mac": "AA:BB:CC:DD:EE:FF",
-	"aes_key": "00112233445566778899aabbccddeeff",
-	"unlock_key": "12345678",
-	"admin_passcode": "",
-	"protocol_type": 5,
-	"protocol_version": 3,
-	"scene": 2,
-	"group_id": 1,
-	"org_id": 1
+  "id": "front-door",
+  "name": "Front Door",
+  "mac": "AA:BB:CC:DD:EE:FF",
+  "aes_key": "00112233445566778899aabbccddeeff",
+  "unlock_key": "12345678",
+  "admin_passcode": "",
+  "protocol_type": 5,
+  "protocol_version": 3,
+  "scene": 2,
+  "group_id": 1,
+  "org_id": 1
 }
 ```
 
@@ -86,15 +97,15 @@ Press **Generate UniFi context**. The ESP serializes the lock configuration and 
 
 ```json
 {
-	"bridge": "ttlock-esp32",
-	"v": 1,
-	"lock": "front-door",
-	"ttlock": {
-		"v": 1,
-		"nonce": "...base64...",
-		"data": "...base64 ciphertext...",
-		"tag": "...base64..."
-	}
+  "bridge": "ttlock-esp32",
+  "v": 1,
+  "lock": "front-door",
+  "ttlock": {
+    "v": 1,
+    "nonce": "...base64...",
+    "data": "...base64 ciphertext...",
+    "tag": "...base64..."
+  }
 }
 ```
 
@@ -197,14 +208,14 @@ Example request:
 
 ```json
 {
-	"id": "front-door",
-	"name": "Front Door",
-	"mac": "AA:BB:CC:DD:EE:FF",
-	"protocol_type": 5,
-	"protocol_version": 3,
-	"scene": 2,
-	"group_id": 1,
-	"org_id": 1
+  "id": "front-door",
+  "name": "Front Door",
+  "mac": "AA:BB:CC:DD:EE:FF",
+  "protocol_type": 5,
+  "protocol_version": 3,
+  "scene": 2,
+  "group_id": 1,
+  "org_id": 1
 }
 ```
 
@@ -213,6 +224,7 @@ On success the response contains `lock_data` for the authenticated installer and
 ### Important testing note
 
 TTLock is an OEM ecosystem and firmware variants exist. The factory provisioning path is based on a known working V3 implementation but has not been validated against every cylinder model. Test new firmware on a lock that is not installed on a critical door first. If initialization fails after beginning, factory-reset the lock before trying again.
+
 
 ## Unlock reliability fixes
 
@@ -223,9 +235,11 @@ misinterpreted as the end of a frame. Protocol-level errors (CRC/decrypt/opcode)
 a valid GATT cache; only GATT/transport failures do. CRC failures log the received ciphertext frame
 and calculated/received CRC bytes for diagnosis without logging decrypted credentials.
 
+
 ### RX CRC compatibility fix
 
 Some tested 5A01 protocol 5/version 3 locks intermittently return a response CRC byte that does not match CRC-8/MAXIM while the encrypted response still decrypts correctly. RX CRC mismatch is therefore no longer immediately fatal. The bridge logs `CRC-WARN`, then requires successful AES-CBC decryption with valid PKCS#7 padding and the expected command echo before accepting the response. The caller still validates the TTLock status byte. If decryption or opcode validation also fails, the exchange fails normally. Outgoing frame CRC generation is unchanged.
+
 
 ## BLE unlock connection optimization
 
@@ -241,19 +255,11 @@ Unlock fast path changes:
 - Keeps the existing per-lock GATT cache and tuned connection parameters.
 - Explicit TTLock protocol rejections are not followed by an expensive immediate BLE reconnect; transport/connect failures remain retryable.
 
+
 ## Safe multi-lock webhook handling (v4)
 
 Each `GET /api/unlock` request is authenticated, decrypted and enqueued independently and receives its own immediate HTTP 202 response/request ID. The ESP32 NimBLE host has one BLE radio owner: unlock jobs are executed serially by a single worker. This is intentional; concurrent GAP connection attempts caused `Already attempting to connect`, `Unable to scan - connection in progress`, connection failures, and eventually a Load access fault. Multiple locks from one UniFi reader are therefore safe: both webhooks are accepted immediately, then lock A and lock B are unlocked in queue order. The v2 early-stop 350 ms target scan, direct-MAC fallback, per-MAC GATT cache, CRC validation, and protocol-rejection handling are retained.
 
-## v6 unlock latency optimization
-
-The normal unlock path now uses **direct-MAC connect first**. It no longer spends ~350 ms on a foreground scan before every attempt. If the direct connection fails, attempt 2 performs the short targeted scan as a recovery mechanism and then reconnects. Existing discovered GATT attributes are preserved across ordinary connection-establishment failures; empty/new client objects are discarded before retry. The bridge intentionally keeps a single BLE radio owner because overlapping ESP32-C3/NimBLE connection procedures proved unsafe. Separate webhook requests are still accepted and queued independently.
-
-Expected serial markers:
-
-- `[TTLock][V6] fast path: skip foreground scan; direct-MAC connect`
-- `[TTLock][V6] recovery attempt: short targeted scan before reconnect`
-- `[TTLock][CACHE] connect failed; preserving existing GATT cache for retry`
 
 ## v7 unlock latency tuning
 
@@ -264,6 +270,27 @@ Expected serial markers:
 - Existing per-lock GATT cache is preserved across ordinary GAP connection failures.
 - The single BLE worker remains in place; separate webhook GET requests are acknowledged and queued independently.
 
+
 ## V7.1 queue retry
 
 V7.1 keeps the V7 BLE fast/recovery policy unchanged. If both normal V7 attempts fail, the unlock job is moved to the end of the worker queue once. Other waiting locks are serviced first. When the failed job returns, it performs one recovery-only attempt (targeted scan + recovery connect), then succeeds or fails permanently. If no other lock is waiting, a 500 ms cooldown is used before the final recovery attempt.
+
+
+## V7.7 BLE connection strategy
+
+V7.7 returns to the reliable V7.1 TTLock/GATT protocol path and changes only BLE discovery synchronization. A dedicated diagnostic run proved the two 5A01 locks advertise service `0x1910` with their configured public MAC addresses approximately every 900 ms.
+
+The bridge now keeps one continuous diagnostic-style NimBLE scanner running: active scan, interval/window 100/100, duplicate callbacks enabled, `onResult()` callbacks, and `maxResults(0)`. It caches plain sighting metadata only; no `NimBLEAdvertisedDevice*` is retained. Before an unlock, the worker accepts a sighting no older than 1200 ms or waits up to 1500 ms, stops the scanner, connects directly to the known public MAC, runs the existing V3 `0x55` / `0x47` flow, disconnects, and resumes scanning.
+
+The existing end-of-queue deferred retry behavior remains enabled.
+
+
+## V7.7 changes
+
+- Suppresses NimBLE INFO scan spam by using `CORE_DEBUG_LEVEL=1`.
+- Scanner callbacks only cache TTLock advertisements carrying service `0x1910`; unrelated devices are ignored by bridge logic.
+- A configured lock sighting is reusable for 10 seconds. This avoids the v7.6 back-to-back-lock bug where the second lock's sighting expired while the first ~1.3 second unlock was running.
+- If there is no usable cached sighting, waits up to 1.2 seconds for the next TTLock advertisement.
+- Existing queue, end-of-queue retry, GATT cache and TTLock `0x55 -> 0x47` protocol are retained.
+
+Note: BLE scanning is radio-wide; NimBLE cannot make the controller physically receive only arbitrary configured MAC addresses. V7.7 filters them immediately in software and suppresses NimBLE's per-device INFO output.

@@ -17,7 +17,7 @@ static BundleCrypto* bundleCrypto = nullptr;
 static WebPortal* portal = nullptr;
 
 static void unlockWorker(void*) {
-  Serial.println("[BLE-WORKER] single radio owner ready (V7.1 end-of-queue retry enabled)");
+  Serial.println("[BLE-WORKER] single radio owner ready (V7.7 quiet filtered 1910 scanner + end-of-queue retry)");
   UnlockJob job;
   while (true) {
     if (xQueueReceive(unlockQueue, &job, portMAX_DELAY) != pdTRUE) continue;
@@ -45,7 +45,7 @@ static void unlockWorker(void*) {
                     : ttlock.unlock(job.lock, error);
       const uint32_t unlockFinished = millis();
 
-      // V7.1: if the normal V7 two-attempt sequence failed, release the radio
+      // V7.6: if the normal two-attempt sequence failed, release the radio
       // and put this lock at the END of the queue once. This lets another lock
       // run immediately and naturally gives the failed lock time to settle.
       if (!ok && !deferredAttempt &&
