@@ -18,6 +18,7 @@ cylinders as the physical locks**.
 > an important door. The ESP32 bridge is an integration layer; it is not
 > a replacement for required mechanical, fire-safety, emergency-egress,
 > or certified access-control hardware.
+> This gateway was tested on the TTLock V3 / `5A01` style locks used during development.
 
 ---
 
