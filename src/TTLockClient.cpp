@@ -272,6 +272,14 @@ const NimBLEAdvertisedDevice* TTLockClient::findDevice(const char* mac, NimBLESc
 }
 
 bool TTLockClient::unlock(const LockConfig& lock, String& error) {
+  // V7.9 preflight: an unlock frame requires real Unix time. Do not connect to
+  // the lock and burn BLE retries while SNTP is still synchronizing.
+  if (time(nullptr) < 1577836800) {
+    error = "ESP system clock is not set; waiting for SNTP before unlocking";
+    Serial.println("[TTLock][V7.9][CLOCK] time not ready; BLE attempt deferred");
+    return false;
+  }
+
   const uint32_t allAttemptsStarted = millis();
   for (uint8_t attempt = 1; attempt <= AppConfig::UNLOCK_ATTEMPTS; ++attempt) {
     const uint32_t attemptStarted = millis();
@@ -310,12 +318,20 @@ bool TTLockClient::unlock(const LockConfig& lock, String& error) {
 }
 
 bool TTLockClient::unlockRecoveryOnly(const LockConfig& lock, String& error) {
+  // Same preflight for deferred retries. The worker will put the request back
+  // at the end of the queue instead of consuming a BLE attempt.
+  if (time(nullptr) < 1577836800) {
+    error = "ESP system clock is not set; waiting for SNTP before unlocking";
+    Serial.println("[TTLock][V7.9][CLOCK] time not ready; deferred retry stays queued");
+    return false;
+  }
+
   const uint32_t started = millis();
-  Serial.println("[TTLock][V7.7] deferred queue retry");
+  Serial.println("[TTLock][V7.9] deferred queue retry");
   String localError;
   const bool ok = unlockAttempt(lock, localError, true);
   if (!ok) error = localError;
-  Serial.printf("[TTLock][V7.7] deferred recovery %s duration=%lu ms%s%s\n",
+  Serial.printf("[TTLock][V7.9] deferred recovery %s duration=%lu ms%s%s\n",
                 ok ? "SUCCESS" : "FAILED",
                 (unsigned long)(millis() - started),
                 ok ? "" : " error=", ok ? "" : localError.c_str());
@@ -720,9 +736,18 @@ bool TTLockClient::unlockV3Attempt(const LockConfig& lock, String& error, bool r
                 (unsigned long)(millis() - unlockStarted),
                 success ? "" : " error=",
                 success ? "" : error.c_str());
-  startGatewayScanner();
-  Serial.println("[TTLock][V7.7][SCAN] continuous scanner resumed");
+  if (!success) {
+    startGatewayScanner();
+    Serial.println("[TTLock][V7.8][SCAN] scanner resumed after failed attempt");
+  } else {
+    Serial.println("[TTLock][V7.8][BURST] unlock complete; scanner remains paused for worker handoff");
+  }
   return success;
+}
+
+void TTLockClient::resumeGatewayScanner() {
+  startGatewayScanner();
+  Serial.println("[TTLock][V7.8][SCAN] continuous scanner resumed (queue drained)");
 }
 
 void TTLockClient::notifyCallback(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {

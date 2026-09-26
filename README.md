@@ -276,16 +276,16 @@ Each `GET /api/unlock` request is authenticated, decrypted and enqueued independ
 V7.1 keeps the V7 BLE fast/recovery policy unchanged. If both normal V7 attempts fail, the unlock job is moved to the end of the worker queue once. Other waiting locks are serviced first. When the failed job returns, it performs one recovery-only attempt (targeted scan + recovery connect), then succeeds or fails permanently. If no other lock is waiting, a 500 ms cooldown is used before the final recovery attempt.
 
 
-## V7.7 BLE connection strategy
+## V7.8 BLE connection strategy
 
-V7.7 returns to the reliable V7.1 TTLock/GATT protocol path and changes only BLE discovery synchronization. A dedicated diagnostic run proved the two 5A01 locks advertise service `0x1910` with their configured public MAC addresses approximately every 900 ms.
+V7.8 returns to the reliable V7.1 TTLock/GATT protocol path and changes only BLE discovery synchronization. A dedicated diagnostic run proved the two 5A01 locks advertise service `0x1910` with their configured public MAC addresses approximately every 900 ms.
 
 The bridge now keeps one continuous diagnostic-style NimBLE scanner running: active scan, interval/window 100/100, duplicate callbacks enabled, `onResult()` callbacks, and `maxResults(0)`. It caches plain sighting metadata only; no `NimBLEAdvertisedDevice*` is retained. Before an unlock, the worker accepts a sighting no older than 1200 ms or waits up to 1500 ms, stops the scanner, connects directly to the known public MAC, runs the existing V3 `0x55` / `0x47` flow, disconnects, and resumes scanning.
 
 The existing end-of-queue deferred retry behavior remains enabled.
 
 
-## V7.7 changes
+## V7.8 changes
 
 - Suppresses NimBLE INFO scan spam by using `CORE_DEBUG_LEVEL=1`.
 - Scanner callbacks only cache TTLock advertisements carrying service `0x1910`; unrelated devices are ignored by bridge logic.
@@ -293,4 +293,16 @@ The existing end-of-queue deferred retry behavior remains enabled.
 - If there is no usable cached sighting, waits up to 1.2 seconds for the next TTLock advertisement.
 - Existing queue, end-of-queue retry, GATT cache and TTLock `0x55 -> 0x47` protocol are retained.
 
-Note: BLE scanning is radio-wide; NimBLE cannot make the controller physically receive only arbitrary configured MAC addresses. V7.7 filters them immediately in software and suppresses NimBLE's per-device INFO output.
+Note: BLE scanning is radio-wide; NimBLE cannot make the controller physically receive only arbitrary configured MAC addresses. V7.8 filters them immediately in software and suppresses NimBLE's per-device INFO output.
+
+
+## V7.9 reliable queue
+
+V7.9 keeps the V7.8 burst handoff and adds reliability safeguards discovered
+from field logs:
+
+- checks system time before opening BLE; requests wait/requeue while SNTP is not ready;
+- failed/rejected unlock requests are moved to the end of the queue for up to five
+  deferred recovery rounds instead of being dropped after one deferred attempt;
+- other queued doors retain priority, so one difficult lock does not block the queue;
+- successful V7.8 fast/cached paths are unchanged.

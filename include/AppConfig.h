@@ -29,9 +29,13 @@ constexpr uint32_t BLE_RESPONSE_TIMEOUT_MS = 6500;
 constexpr uint32_t BLE_POST_NOTIFY_SETTLE_MS = 100;
 constexpr uint32_t RETRY_DELAY_MS = 250;
 constexpr uint8_t UNLOCK_ATTEMPTS = 2;
-// V7.6: after both V7 attempts fail, move the job to the back of the queue once.
-constexpr uint8_t MAX_DEFERRED_UNLOCK_RETRIES = 1;
+// V7.9 reliability: a request that reached the queue gets several deferred
+// recovery rounds. Each failed round goes to the END so other doors are never
+// blocked by one troublesome lock.
+constexpr uint8_t MAX_DEFERRED_UNLOCK_RETRIES = 5;
 constexpr uint32_t DEFERRED_RETRY_IDLE_COOLDOWN_MS = 500;
+constexpr uint32_t DEFERRED_RETRY_BACKOFF_MS = 500;
+constexpr uint32_t CLOCK_RETRY_BACKOFF_MS = 1000;
 constexpr uint32_t SESSION_TTL_MS = 12UL * 60UL * 60UL * 1000UL;
 constexpr size_t MAX_HTTP_BODY = 8192;
 constexpr char BUNDLE_AAD[] = "ttlock-bridge:v1";
