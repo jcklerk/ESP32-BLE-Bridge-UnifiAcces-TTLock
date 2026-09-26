@@ -1,0 +1,22 @@
+[env:esp32-poe]
+platform = espressif32
+board = seeed_xiao_esp32c3
+framework = arduino
+monitor_speed = 115200
+lib_deps =
+    h2zero/NimBLE-Arduino@^2.5.1
+    bblanchon/ArduinoJson@^7.4.2
+build_flags =
+    -D CORE_DEBUG_LEVEL=3
+    -D USE_ETHERNET=0
+    '-D WIFI_SSID="SSID"'
+    '-D WIFI_PASSWORD="PASSWORD"'
+    ; -D USE_ETHERNET=1
+    ; -D ETH_PHY_TYPE=ETH_PHY_LAN8720
+    ; -D ETH_PHY_ADDR=0
+    ; -D ETH_PHY_MDC=23
+    ; -D ETH_PHY_MDIO=18
+    ; -D ETH_PHY_POWER=-1
+    ; -D ETH_CLK_MODE=ETH_CLOCK_GPIO0_IN
+
+; For Wi-Fi-only development, copy this environment and set USE_ETHERNET=0.
