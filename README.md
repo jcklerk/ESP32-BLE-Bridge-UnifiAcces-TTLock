@@ -1,308 +1,1054 @@
+# UniFi Access → TTLock ESP32 BLE Bridge
 
-## v6 unlock latency optimization
+A local ESP32 bridge that allows **UniFi Access** to unlock
+**TTLock-compatible BLE smart cylinders**.
 
-The normal unlock path now uses **direct-MAC connect first**. It no longer spends ~350 ms on a foreground scan before every attempt. If the direct connection fails, attempt 2 performs the short targeted scan as a recovery mechanism and then reconnects. Existing discovered GATT attributes are preserved across ordinary connection-establishment failures; empty/new client objects are discarded before retry. The bridge intentionally keeps a single BLE radio owner because overlapping ESP32-C3/NimBLE connection procedures proved unsafe. Separate webhook requests are still accepted and queued independently.
+The bridge listens for webhook calls from UniFi Access. When an
+authorized UniFi Access reader unlock event occurs, UniFi Alarm Manager
+calls the ESP32. The ESP32 decrypts the selected lock configuration,
+connects to that TTLock over Bluetooth Low Energy, sends the unlock
+command, and disconnects again.
 
-Expected serial markers:
+This makes it possible to use a **UniFi Access Reader as the
+credential/access-control system** while using one or more **TTLock BLE
+cylinders as the physical locks**.
 
-- `[TTLock][V6] fast path: skip foreground scan; direct-MAC connect`
-- `[TTLock][V6] recovery attempt: short targeted scan before reconnect`
-- `[TTLock][CACHE] connect failed; preserving existing GATT cache for retry`
+> \[!IMPORTANT\] This project uses an unofficial, reverse-engineered
+> TTLock BLE protocol. Test the complete installation before using it on
+> an important door. The ESP32 bridge is an integration layer; it is not
+> a replacement for required mechanical, fire-safety, emergency-egress,
+> or certified access-control hardware.
+> This gateway was tested on the TTLock V3 / `5A01` style locks used during development.
 
-# UniFi Access → TTLock local bridge (Arduino / ESP32)
+---
 
-A local ESP32 bridge intended for a PoE/Ethernet installation. UniFi Access remains the access-control authority. For each door, UniFi Alarm Manager/Webhooks stores an **encrypted TTLock context**. When the door webhook fires, the ESP decrypts that context in RAM, queues a BLE job, connects to the cylinder, performs the TTLock V3 unlock handshake, and immediately disconnects.
+## Features
 
-## Main properties
+- UniFi Access → TTLock integration using **Alarm Manager webhooks**
+- Local operation; normal unlocking does not require the TTLock cloud
+- ESP32-C3 + NimBLE
+- Supports TTLock V3 / `5A01` style locks used during development
+- TTLock BLE service `0x1910`
+- Cached BLE/GATT information for faster unlocks
+- Continuous background discovery of TTLock advertisements
+- Direct BLE connection to configured lock MAC addresses
+- Disconnects after each unlock instead of maintaining permanent BLE
+  connections
+- Multiple TTLock locks can be controlled by one ESP32 bridge
+- Multiple webhook actions can be attached to one UniFi Access reader
+- Multiple TTLock locks can therefore unlock from one UniFi reader
+  event
+- FreeRTOS unlock queue
+- Burst handling for multiple nearly simultaneous unlock requests
+- Failed jobs are moved to the end of the queue and retried
+- Up to 5 deferred recovery rounds
+- BLE connection retry/recovery
+- Protocol rejection retry/recovery
+- SNTP/system-time preflight before an unlock is attempted
+- Encrypted lock configuration in webhook headers
+- Local web portal for setup, BLE scanning, provisioning, testing and
+  webhook generation
+- Factory-new TTLock V3 initialization support
+- Site encryption key and webhook Bearer authentication
+- Wi-Fi development configuration and optional Ethernet/PoE support
 
-- Arduino framework / PlatformIO.
-- Up to 10 queued unlock requests by default (`MAX_PENDING_UNLOCKS`).
-- No permanent BLE connection.
-- Runtime flow: `scan → connect → subscribe → CHECK_USER_TIME → UNLOCK → disconnect`.
-- TTLock BLE V3 service `1910`, write `FFF2`, notify `FFF4`; Nordic-UART-style fallback is also included.
-- AES-128-CBC TTLock command encryption with key-as-IV and PKCS#7 padding.
-- CRC-8/MAXIM packet CRC.
-- AES-256-GCM for the portable lock bundle stored in UniFi Access.
-- Local web portal with admin password, site encryption key, webhook Bearer token, BLE scan, test unlock and UniFi context generation.
-- Lock keys are not stored as an ESP-side lock database. The decrypted `LockConfig` exists only for the current request/job and is zeroed afterward.
+---
 
-## Important limitation
+## How it works
 
-This project controls **already-paired/initialized TTLock V3 locks**. The web portal can discover a lock and import/test its AES key + unlock key, but it does not yet claim a factory-reset TTLock or generate its initial eKey. The current `roquerodrigo/ttlock-ble` client is likewise explicitly an already-paired-lock client. Factory provisioning should be added as a separate protocol module and tested on the exact cylinder model before use.
+The basic data flow is:
 
-## Build
+```text
+User presents credential
+        │
+        ▼
+UniFi Access Reader
+        │
+        ▼
+UniFi Access authorizes access
+        │
+        ▼
+Door Unlocked event
+        │
+        ▼
+UniFi Alarm Manager
+        │
+        ├── Webhook → TTLock Front Door
+        │
+        ├── Webhook → TTLock Inner Door
+        │
+        └── Webhook → other TTLock(s)
+                        │
+                        ▼
+                  ESP32 Bridge
+                        │
+                 decrypt lock data
+                        │
+                  queue unlock job
+                        │
+                 BLE / NimBLE
+                        │
+                        ▼
+                    TTLock
+```
 
-The provided `platformio.ini` defaults to an ESP32 with LAN8720/RMII Ethernet pins matching the common Espressif example:
+UniFi Access remains responsible for deciding **who is allowed to
+enter**. The ESP32 only reacts to the resulting webhook and unlocks the
+TTLock associated with that webhook.
 
-- PHY: LAN8720
-- PHY address: `0`
-- MDC: GPIO23
-- MDIO: GPIO18
-- PHY power: `-1`
-- reference clock: GPIO0 input
+### TTLock unlock flow
 
-Change the `ETH_*` build flags for your PoE board. For example, some Olimex/custom boards use a different clock or PHY power pin.
+For a normal TTLock V3 unlock the bridge performs approximately:
 
-Dependencies:
+```text
+Receive webhook
+    ↓
+Authenticate Bearer token
+    ↓
+Decrypt lock configuration
+    ↓
+Queue UnlockJob
+    ↓
+Use cached TTLock advertisement
+    ↓
+Connect over BLE
+    ↓
+Reuse cached GATT attributes when available
+    ↓
+Subscribe to FFF4 notifications
+    ↓
+Send CHECK_USER_TIME (0x55)
+    ↓
+Receive lock response
+    ↓
+Send UNLOCK (0x47)
+    ↓
+Receive success response
+    ↓
+Disconnect
+```
 
-- Arduino-ESP32
-- `h2zero/NimBLE-Arduino` 2.5.x
-- ArduinoJson 7.x
+The BLE connection is not kept permanently open. This keeps the design
+simple and avoids maintaining an unnecessary connection to
+battery-powered cylinders.
 
-Build/upload:
+---
+
+## Multiple locks on one reader
+
+One UniFi Access reader can trigger **multiple TTLock cylinders**.
+
+For example:
+
+```text
+Reader: Main Entrance
+
+Door Unlocked
+    │
+    ├── Webhook 1 → Front Door TTLock
+    ├── Webhook 2 → Hall TTLock
+    └── Webhook 3 → Equipment Room TTLock
+```
+
+Each webhook contains the encrypted configuration for a specific TTLock.
+
+When these webhooks arrive close together, the ESP32 places them in its
+unlock queue and processes them using one BLE radio.
+
+The current v7.9 firmware includes burst handling so the next queued
+lock can be processed immediately after the previous lock finishes.
+
+---
+
+## Reliability and retry system
+
+BLE is a radio protocol and an individual connection can occasionally
+fail.
+
+The bridge therefore does not immediately discard an unlock request.
+
+The current reliability strategy is:
+
+```text
+Normal unlock
+    │
+    ├── Success → done
+    │
+    └── Failure
+          ↓
+       recovery attempt
+          │
+          ├── Success → done
+          │
+          └── Failure / lock rejects command
+                ↓
+          move request to END of queue
+                ↓
+          allow other locks to run
+                ↓
+          retry failed lock later
+```
+
+v7.9 allows up to **5 deferred recovery rounds**.
+
+This is particularly useful when several locks are connected to one
+reader. A temporary problem with one lock should not prevent the other
+locks from being processed.
+
+### System clock
+
+TTLock's unlock protocol uses the current time.
+
+Before starting BLE, v7.9 verifies that the ESP32 has a valid system
+clock. If SNTP has not synchronized yet, the request is requeued instead
+of wasting BLE attempts.
+
+For isolated networks, configure a reachable local NTP server.
+
+---
+
+# Hardware
+
+The current PlatformIO target is:
+
+```ini
+board = seeed_xiao_esp32c3
+framework = arduino
+```
+
+The project was developed with a **Seeed Studio XIAO ESP32-C3**.
+
+The bridge can run using:
+
+- Wi-Fi, or
+- Ethernet/PoE hardware supported by the project configuration.
+
+For a permanent access-control installation, Ethernet/PoE is generally
+preferable because the bridge can be powered and networked from the same
+infrastructure.
+
+---
+
+# Building and flashing
+
+## Requirements
+
+Install:
+
+- Visual Studio Code
+- PlatformIO
+- USB data cable for the ESP32-C3
+
+Or install PlatformIO Core and use it from the terminal.
+
+The important project dependencies are installed automatically by
+PlatformIO:
+
+```ini
+h2zero/NimBLE-Arduino@^2.5.1
+bblanchon/ArduinoJson@^7.4.2
+```
+
+---
+
+## Configure networking
+
+Open:
+
+```text
+platformio.ini
+```
+
+### Wi-Fi
+
+For Wi-Fi operation:
+
+```ini
+-D USE_ETHERNET=0
+'-D WIFI_SSID="YOUR_WIFI_SSID"'
+'-D WIFI_PASSWORD="YOUR_WIFI_PASSWORD"'
+```
+
+Do **not** commit real Wi-Fi credentials to a public Git repository.
+
+### Ethernet / PoE
+
+Enable Ethernet:
+
+```ini
+-D USE_ETHERNET=1
+```
+
+Then configure the PHY for your ESP32 Ethernet/PoE board.
+
+Example LAN8720 settings:
+
+```ini
+-D ETH_PHY_TYPE=ETH_PHY_LAN8720
+-D ETH_PHY_ADDR=0
+-D ETH_PHY_MDC=23
+-D ETH_PHY_MDIO=18
+-D ETH_PHY_POWER=-1
+-D ETH_CLK_MODE=ETH_CLOCK_GPIO0_IN
+```
+
+The correct pins depend on the board.
+
+---
+
+## Optional NTP configuration
+
+The TTLock unlock packet requires valid time.
+
+If the bridge cannot reach public NTP servers, configure local NTP
+servers:
+
+```ini
+-D NTP_SERVER_1=\"192.168.1.1\"
+-D NTP_SERVER_2=\"192.168.1.2\"
+```
+
+Use addresses that are reachable from the ESP32's VLAN.
+
+---
+
+## Flash with PlatformIO
+
+Connect the ESP32 over USB.
+
+Build:
 
 ```bash
 pio run
+```
+
+Upload:
+
+```bash
 pio run -t upload
+```
+
+Open the serial monitor:
+
+```bash
 pio device monitor
 ```
 
-## First setup
+The configured serial speed is:
 
-1. Connect the ESP to PoE/Ethernet.
-2. Browse to `http://<esp-ip>/`.
-3. Set an admin password (minimum 8 characters).
-4. The ESP generates:
-   - a random 256-bit **site key**;
-   - a random **webhook Bearer token**.
-5. Back up the site key somewhere secure. A replacement ESP must be configured with exactly the same site key to decrypt existing UniFi lock contexts.
-
-The site key itself is stored in ESP Preferences for normal operation. For a hardened installation, enable ESP32 flash encryption + secure boot; otherwise physical flash extraction may reveal it.
-
-## Add a lock
-
-The portal supports BLE scanning to pre-fill the lock MAC/name. Enter:
-
-```json
-{
-  "id": "front-door",
-  "name": "Front Door",
-  "mac": "AA:BB:CC:DD:EE:FF",
-  "aes_key": "00112233445566778899aabbccddeeff",
-  "unlock_key": "12345678",
-  "admin_passcode": "",
-  "protocol_type": 5,
-  "protocol_version": 3,
-  "scene": 2,
-  "group_id": 1,
-  "org_id": 1
-}
+```text
+115200 baud
 ```
 
-Use **Test unlock** first. The test does not keep a BLE link open.
+After boot you should see messages similar to:
 
-## Generate the UniFi context
-
-Press **Generate UniFi context**. The ESP serializes the lock configuration and encrypts it with AES-256-GCM using the site key. Example shape:
-
-```json
-{
-  "bridge": "ttlock-esp32",
-  "v": 1,
-  "lock": "front-door",
-  "ttlock": {
-    "v": 1,
-    "nonce": "...base64...",
-    "data": "...base64 ciphertext...",
-    "tag": "...base64..."
-  }
-}
+```text
+UniFi Access -> TTLock Arduino bridge
+Web portal listening on port 80
+[BLE-WORKER] single radio owner ready ...
 ```
 
-The AES key and unlock key are inside `data`; they are not plaintext in UniFi.
+---
 
-## UniFi Access Alarm Manager webhook
+# First-time setup
 
-Configure a webhook for the authorized door-unlock event:
+After the ESP32 is connected to the network, determine its IP address
+from:
 
-- Method: `POST`
-- URL: `http://<esp-ip>/api/unlock`
-- Authentication: Bearer
-- Token: the ESP's webhook token
-- Context: paste the generated encrypted JSON
+- the serial console, or
+- your DHCP/UniFi client list.
 
-The endpoint understands the encrypted object when it is:
+Open:
 
-- the request root itself;
-- under `context`;
-- under `customContext`.
-
-This is useful because UniFi versions/templates can wrap custom context differently.
-
-The webhook returns HTTP `202` as soon as the request is authenticated, decrypted and queued. BLE work is performed by a FreeRTOS worker so the HTTP request does not remain open while the lock connects.
-
-## Replacement ESP
-
-If a bridge dies:
-
-1. Flash this project to a replacement.
-2. Set a new local admin password.
-3. Paste the **same site key** in the portal.
-4. Set the webhook token to the old value if you add that option, or regenerate the token and update the UniFi webhook auth setting.
-5. Existing encrypted lock contexts do not need to change as long as the site key is unchanged.
-
-Currently the UI exposes generation of a new webhook token; if you want a zero-change replacement, add/manual-set the same token in `SettingsStore`, or update the UniFi webhook's Bearer token once.
-
-## Clock / local-only network
-
-The unlock payload contains Unix epoch seconds. `main.cpp` calls SNTP via `configTime()`. If the Access VLAN has no Internet access, define a reachable local NTP server, for example in `platformio.ini`:
-
-```ini
-build_flags =
-    ...
-    -D NTP_SERVER_1=\"192.168.10.1\"
-    -D NTP_SERVER_2=\"192.168.10.2\"
+```text
+http://ESP32-IP/
 ```
 
-The bridge refuses to unlock if its clock is still obviously unset.
+For example:
 
-## Security model
+```text
+http://192.168.1.50/
+```
 
-- Keep the ESP and UniFi Access controller on an access-control VLAN.
-- Firewall `/api/unlock` so only the UniFi controller can reach it if possible.
-- Use the Bearer token even on the isolated VLAN.
-- The portal is plain HTTP in this Arduino build. Do not expose it to untrusted networks. For higher assurance, terminate HTTPS on a local reverse proxy or add an HTTPS-capable embedded server.
-- Enable Secure Boot and Flash Encryption before using production door credentials.
-- Store the site key in a proper secrets/password manager as the disaster-recovery key.
+On first setup:
 
-## Source references used for the TTLock implementation
+1.  Create the local administrator password.
+2.  The bridge generates a **Site Key**.
+3.  The bridge generates a **Webhook Token**.
+4.  Store the Site Key somewhere safe.
 
-The BLE behavior mirrors current public reverse-engineered implementations rather than inventing a new protocol: `roquerodrigo/ttlock-ble` for the current V3 frame/handshake and `h2zero/NimBLE-Arduino` for the Arduino BLE client API. TTLock BLE is unofficial and firmware variants can differ, so validate on a test cylinder before deployment.
+The Site Key is important because it encrypts the TTLock configuration
+used by the UniFi webhooks.
 
-## Factory-new TTLock provisioning
+If the ESP32 has to be replaced, using the same Site Key allows the
+existing encrypted TTLock data to remain usable.
 
-The web portal now has **Initialize New Lock** for factory-reset TTLock V3 devices.
+---
 
-Workflow:
+# Adding an existing TTLock
 
-1. Factory-reset the TTLock.
-2. Wake/touch its keypad. Factory-reset locks are typically discoverable for only a short window.
-3. In the bridge portal, click **Scan nearby TTLocks** and select the lock.
-4. Confirm protocol values (currently provisioning supports protocol type `5`, version `3`; defaults are scene `2`, group `1`, organisation `1`).
-5. Click **Initialize New Lock**.
-6. The ESP performs the local BLE initialization sequence, disconnects, and returns an encrypted UniFi context bundle.
-7. Store the generated bundle as the custom context of the corresponding UniFi Access Alarm Manager webhook.
+Open the ESP32 web portal.
 
-The implemented V3 provisioning sequence follows the public `kind3r/ttlock-sdk-js` implementation:
+Use **Scan nearby TTLocks**.
 
-- `COMM_INITIALIZATION` (`0x45`) using the factory/default AES key.
-- `COMM_GET_AES_KEY` (`0x19`) using the literal `SCIENER` request marker; the lock returns its permanent 16-byte AES key.
-- `COMM_ADD_ADMIN` (`0x56`) using a locally generated admin secret and unlock key.
-- time calibration when the ESP clock is valid (non-fatal if unsupported).
-- device-feature query (non-fatal).
-- `OPERATE_FINISHED` (`0x57`).
-- disconnect immediately.
+The bridge scans for compatible TTLock BLE devices and displays
+information such as:
 
-The generated `admin_ps` is preserved inside the encrypted UniFi bundle for possible future administrative operations. It is different from the optional keypad/admin passcode.
+```text
+5A01_6cea64
+21:BF:37:64:EA:6C
+-50 dBm
+```
 
-### HTTP API
+Select the required lock.
 
-Authenticated local portal endpoint:
+For an already initialized TTLock, configure the required lock
+information, including:
+
+- Lock ID
+- Lock name
+- BLE MAC address
+- AES key
+- Unlock key
+- Protocol type
+- Protocol version
+- Scene
+- Group ID
+- Organisation ID
+
+Typical protocol values for the tested V3 locks are:
+
+```text
+Protocol type:    5
+Protocol version: 3
+Scene:            2
+Group ID:         1
+Organisation ID:  1
+```
+
+Use **Test Unlock** before configuring UniFi.
+
+The lock should physically unlock and the serial console should finish
+with something similar to:
+
+```text
+Unlock Front Door: SUCCESS
+```
+
+---
+
+# Initializing a factory-new TTLock
+
+The web portal also contains **Initialize New Lock** for supported
+factory-reset TTLock V3 devices.
+
+Typical workflow:
+
+1.  Factory-reset the TTLock.
+2.  Wake the lock.
+3.  Open the ESP32 web portal.
+4.  Select **Scan nearby TTLocks**.
+5.  Select the factory-reset lock.
+6.  Verify the protocol information.
+7.  Select **Initialize New Lock**.
+8.  Wait for initialization to complete.
+9.  Test the lock.
+10. Generate the UniFi webhook information.
+
+Factory provisioning currently targets the tested V3 protocol family.
+TTLock is an OEM ecosystem and firmware differences exist, so test this
+with your exact cylinder model.
+
+---
+
+# Generate the UniFi webhook
+
+After the lock has been configured and tested, select:
+
+**Generate UniFi context**
+
+The portal generates something similar to:
+
+```text
+Authorization: Bearer YOUR_WEBHOOK_TOKEN
+
+X-TTLock-Nonce: ENCRYPTED_NONCE
+X-TTLock-Data: ENCRYPTED_LOCK_DATA
+X-TTLock-Tag: AUTHENTICATION_TAG
+
+Method: GET or POST
+URL: http://ESP32-IP/api/unlock
+Body: none
+```
+
+Each lock gets different encrypted TTLock headers.
+
+The lock's AES key and unlock key are encrypted inside `X-TTLock-Data`.
+
+Do not manually copy the headers from one lock to another.
+
+---
+
+# Configure UniFi Access
+
+UniFi Alarm Manager is used to connect an authorized Access unlock event
+to the ESP32.
+
+Ubiquiti documents Alarm Manager as consisting of:
+
+1.  **Trigger**
+2.  **Scope**
+3.  **Action**
+
+For this project:
+
+```text
+Trigger = Door unlocked
+Scope   = Specific Access reader / door
+Action  = Webhook to ESP32
+```
+
+---
+
+## 1. Open Alarm Manager
+
+Open your UniFi Console and go to:
+
+```text
+UniFi Access
+    ↓
+Alarm Manager
+```
+
+Select:
+
+**Create Alarm**
+
+Give it a useful name, for example:
+
+```text
+Front Entrance → TTLock
+```
+
+---
+
+## 2. Select the unlock trigger
+
+Select an Access unlock event as the trigger.
+
+The intended configuration is:
+
+```text
+Category: Unlocks
+Event:    Door Unlocked
+```
+
+The exact wording can vary slightly between UniFi Access versions.
+
+The important point is that the alarm should run when UniFi Access has
+accepted the access event and the selected door/reader is unlocked.
+
+---
+
+## 3. Select the specific reader / door
+
+Set the alarm **Scope** to the Access device or door that should control
+the TTLock.
+
+For example:
+
+```text
+Trigger:
+    Door Unlocked
+
+Scope:
+    Main Entrance Reader
+```
+
+Do not use every reader/site-wide scope unless that is intentionally
+required.
+
+A specific scope prevents another Access reader from accidentally
+triggering the TTLock webhook.
+
+---
+
+# 4. Add the webhook
+
+Under the alarm's actions, add a **Custom Webhook**.
+
+Use the URL generated by the ESP32:
+
+```text
+http://ESP32-IP/api/unlock
+```
+
+The bridge accepts:
+
+```text
+GET
+```
+
+or:
+
+```text
+POST
+```
+
+No request body is required.
+
+---
+
+## 5. Add authentication
+
+Add this custom HTTP header:
+
+```text
+Authorization: Bearer YOUR_WEBHOOK_TOKEN
+```
+
+The token must match the **Webhook Token** shown in the ESP32 web
+portal.
+
+Requests with an invalid token are rejected.
+
+---
+
+## 6. Add the encrypted TTLock headers
+
+Copy the three headers generated by the ESP32 for this particular lock:
+
+```text
+X-TTLock-Nonce: ...
+X-TTLock-Data: ...
+X-TTLock-Tag: ...
+```
+
+A complete webhook therefore looks conceptually like:
 
 ```http
+GET /api/unlock HTTP/1.1
+Host: 192.168.1.50
+Authorization: Bearer YOUR_WEBHOOK_TOKEN
+X-TTLock-Nonce: ...
+X-TTLock-Data: ...
+X-TTLock-Tag: ...
+```
+
+There is no request body.
+
+When the request is accepted, the ESP32 normally returns:
+
+```text
+HTTP 202 Accepted
+```
+
+`202` means the request has been authenticated, decrypted and placed
+into the BLE unlock queue. The physical BLE unlock continues
+asynchronously.
+
+---
+
+# Multiple TTLocks for one UniFi reader
+
+This is supported.
+
+For example, suppose the **Main Entrance Reader** should unlock two
+TTLock cylinders:
+
+```text
+Main Entrance Reader
+       │
+       └── Door Unlocked
+              │
+              ├── Webhook → Front Door
+              └── Webhook → Inner Door
+```
+
+Create/add a separate webhook action for each TTLock.
+
+### Webhook 1
+
+```text
+URL:
+http://192.168.1.50/api/unlock
+
+Authorization:
+Bearer <same bridge token>
+
+X-TTLock-Nonce:
+<Front Door nonce>
+
+X-TTLock-Data:
+<Front Door encrypted data>
+
+X-TTLock-Tag:
+<Front Door tag>
+```
+
+### Webhook 2
+
+```text
+URL:
+http://192.168.1.50/api/unlock
+
+Authorization:
+Bearer <same bridge token>
+
+X-TTLock-Nonce:
+<Inner Door nonce>
+
+X-TTLock-Data:
+<Inner Door encrypted data>
+
+X-TTLock-Tag:
+<Inner Door tag>
+```
+
+Both webhooks point to the same ESP32 endpoint.
+
+The encrypted headers tell the bridge **which TTLock should be
+unlocked**.
+
+When UniFi sends both webhooks, the ESP32 queues both requests and
+processes them one after another.
+
+---
+
+# Example installation
+
+```text
+                         ┌──────────────────────────┐
+                         │      UniFi Console       │
+                         │      UniFi Access        │
+                         └────────────┬─────────────┘
+                                      │
+                               Alarm Manager
+                                      │
+                           Door Unlocked event
+                                      │
+                   ┌──────────────────┴──────────────────┐
+                   │                                     │
+             Webhook Lock A                        Webhook Lock B
+                   │                                     │
+                   └──────────────────┬──────────────────┘
+                                      │
+                                      ▼
+                         ┌──────────────────────────┐
+                         │       ESP32 Bridge       │
+                         │                          │
+                         │ HTTP webhook endpoint    │
+                         │ encrypted lock config    │
+                         │ FreeRTOS queue           │
+                         │ NimBLE                   │
+                         └────────────┬─────────────┘
+                                      │
+                           Bluetooth Low Energy
+                          ┌───────────┴───────────┐
+                          │                       │
+                          ▼                       ▼
+                    TTLock A                  TTLock B
+```
+
+---
+
+# Webhook security
+
+The unlock endpoint is:
+
+```text
+/api/unlock
+```
+
+It requires a valid:
+
+```text
+Authorization: Bearer ...
+```
+
+and valid encrypted TTLock headers.
+
+The lock configuration is protected using the bridge's Site Key.
+
+Recommended production setup:
+
+- Put UniFi Access and the ESP32 bridge on a trusted/isolated VLAN.
+- Give the ESP32 a static DHCP reservation.
+- Firewall access to the ESP32.
+- Ideally only allow the UniFi Console/controller to access
+  `/api/unlock`.
+- Do not expose the ESP32 web portal to the Internet.
+- Keep the Webhook Token private.
+- Keep the Site Key backed up securely.
+- Do not commit Wi-Fi credentials to Git.
+- Consider ESP32 Secure Boot and Flash Encryption for production
+  installations.
+
+The current embedded web portal uses HTTP, so it should only be
+reachable from a trusted management network.
+
+---
+
+# Important backup information
+
+Back up at least:
+
+```text
+Site Key
+Webhook Token
+Lock configuration / generated webhook headers
+```
+
+The **Site Key is especially important**.
+
+If you replace the ESP32 and restore the same Site Key, existing
+encrypted lock webhook data can continue to be decrypted.
+
+If you generate a new Site Key, regenerate the webhook headers for every
+lock.
+
+If you generate a new Webhook Token, update the `Authorization` header
+in UniFi Alarm Manager.
+
+---
+
+# Troubleshooting
+
+## Webhook returns unauthorized
+
+Check:
+
+```text
+Authorization: Bearer <token>
+```
+
+Make sure the token exactly matches the ESP32 portal.
+
+---
+
+## Webhook is accepted but lock does not immediately unlock
+
+Check the serial monitor:
+
+```bash
+pio device monitor
+```
+
+Look for:
+
+```text
+Unlock request:
+BLE connect
+0x55 exchange
+0x47 exchange
+Unlock ...: SUCCESS
+```
+
+The HTTP request can return `202` before BLE processing is finished.
+This is intentional.
+
+---
+
+## `UNLOCK rejected by lock`
+
+The lock was successfully reached over BLE, but the TTLock rejected that
+unlock command.
+
+v7.9 automatically moves the request to the end of the queue and retries
+it.
+
+Look for:
+
+```text
+[RELIABLE] attempt round failed
+[RELIABLE] retry queued
+```
+
+followed later by:
+
+```text
+Unlock ...: SUCCESS
+```
+
+---
+
+## BLE connection fails
+
+The bridge automatically performs recovery attempts.
+
+An occasional BLE connection failure can happen because the TTLock is a
+battery-powered advertising device.
+
+The continuous scanner and GATT cache are used to reduce connection
+time.
+
+---
+
+## Clock / SNTP problem
+
+If the serial console reports that the system clock is not ready, make
+sure the ESP32 can reach an NTP server.
+
+For isolated VLANs, configure local NTP servers in `platformio.ini`.
+
+v7.9 keeps the unlock request queued while waiting for valid time rather
+than immediately losing the request.
+
+---
+
+## One reader controls several locks
+
+Add **multiple webhook actions** to the same UniFi Access alarm.
+
+Generate the headers separately for each TTLock.
+
+Do not use the encrypted `X-TTLock-*` headers from Lock A for Lock B.
+
+---
+
+# Current v7.9 architecture
+
+```text
+WebPortal
+   │
+   ├── setup/login
+   ├── BLE scan
+   ├── initialize lock
+   ├── test lock
+   ├── generate encrypted webhook headers
+   └── /api/unlock
+            │
+            ▼
+       Unlock Queue
+            │
+            ▼
+       BLE Worker
+            │
+            ▼
+      TTLockClient
+            │
+            ├── background sightings
+            ├── per-lock GATT cache
+            ├── fast connection
+            ├── recovery connection
+            ├── CHECK_USER_TIME
+            ├── UNLOCK
+            └── disconnect
+```
+
+Only one BLE operation owns the ESP32-C3 radio at a time.
+
+Incoming HTTP webhook requests can still be received while another lock
+is being processed because they are placed into the FreeRTOS queue.
+
+---
+
+# API overview
+
+The project currently exposes endpoints including:
+
+```text
+GET  /api/status
+POST /api/setup
+POST /api/login
+
+GET  /api/secrets
+
+POST /api/settings/site-key
+POST /api/settings/generate-site-key
+POST /api/settings/regenerate-token
+
+GET  /api/ble/scan
+
 POST /api/locks/init
-Content-Type: application/json
+POST /api/locks/test
+POST /api/locks/bundle
+
+GET  /api/unlock
+POST /api/unlock
 ```
 
-Example request:
+The setup/configuration endpoints are intended for the local web portal.
 
-```json
-{
-  "id": "front-door",
-  "name": "Front Door",
-  "mac": "AA:BB:CC:DD:EE:FF",
-  "protocol_type": 5,
-  "protocol_version": 3,
-  "scene": 2,
-  "group_id": 1,
-  "org_id": 1
-}
+The UniFi integration uses:
+
+```text
+GET/POST /api/unlock
 ```
 
-On success the response contains `lock_data` for the authenticated installer and `bundle`, which is the AES-256-GCM encrypted object intended for UniFi Access. Normal webhook unlocks still decrypt the lock data only in RAM and disconnect BLE after each operation.
+---
 
-### Important testing note
+# UniFi requirements
 
-TTLock is an OEM ecosystem and firmware variants exist. The factory provisioning path is based on a known working V3 implementation but has not been validated against every cylinder model. Test new firmware on a lock that is not installed on a critical door first. If initialization fails after beginning, factory-reset the lock before trying again.
+UniFi Alarm Manager is available in UniFi Access on supported/current
+UniFi OS and Access versions.
 
+The UniFi documentation describes Access alarm triggers including **door
+unlocked** events and allows the scope to be restricted to individual
+Access devices or door locations.
 
-## Unlock reliability fixes
+Official documentation:
 
-The fast unlock path uses direct MAC connections and retains NimBLE's per-peer GATT cache.
-TTLock notification frames are parsed from the binary protocol header/payload length rather than
-searching encrypted ciphertext for CR/LF. This prevents an encrypted `0D 0A` sequence from being
-misinterpreted as the end of a frame. Protocol-level errors (CRC/decrypt/opcode) no longer discard
-a valid GATT cache; only GATT/transport failures do. CRC failures log the received ciphertext frame
-and calculated/received CRC bytes for diagnosis without logging decrypted credentials.
+UniFi Alarm Manager -- Customize Alerts, Integrations and Automations
+Across UniFi
 
+https://help.ui.com/hc/en-us/articles/27721287753239-UniFi-Alarm-Manager-Customize-Alerts-Integrations-and-Automations-Across-UniFi
 
-### RX CRC compatibility fix
+---
 
-Some tested 5A01 protocol 5/version 3 locks intermittently return a response CRC byte that does not match CRC-8/MAXIM while the encrypted response still decrypts correctly. RX CRC mismatch is therefore no longer immediately fatal. The bridge logs `CRC-WARN`, then requires successful AES-CBC decryption with valid PKCS#7 padding and the expected command echo before accepting the response. The caller still validates the TTLock status byte. If decryption or opcode validation also fails, the exchange fails normally. Outgoing frame CRC generation is unchanged.
+# Project status
 
+The current development baseline is **v7.9**.
 
-## BLE unlock connection optimization
+The focus of v7.9 is:
 
-The unlock path uses a 700 ms passive, 100%-duty targeted scan before connecting. If the configured lock is observed, the client connects from the fresh advertisement instead of blindly waiting for the MAC to advertise. If it is not observed, the bridge falls back to direct-MAC connection. Unlock clients use a 2.5 s connection timeout, 15 ms initial connection interval, zero latency, and 9 dBm TX power. Timing logs report `fast target scan HIT/MISS` and either `BLE connect from ADV` or `direct BLE fallback`, making A/B performance easy to measure.
+- reliable multi-lock operation;
+- fast cached BLE connections;
+- queueing simultaneous UniFi webhook requests;
+- automatic recovery instead of silently skipping a lock;
+- retaining the fast v7.8 burst behavior.
 
-## Connection optimization v2
+Example successful flow:
 
-Unlock fast path changes:
+```text
+Webhook Lock A
+    ↓
+Lock A SUCCESS
+    ↓
+direct queue handoff
+    ↓
+Webhook Lock B
+    ↓
+Lock B SUCCESS
+```
 
-- Targeted passive scan is capped at 350 ms and stops immediately when the configured lock MAC is discovered.
-- Logs the exact time-to-advertisement and RSSI on an early hit.
-- Falls back immediately to direct-MAC connection when the target is not seen.
-- Keeps the existing per-lock GATT cache and tuned connection parameters.
-- Explicit TTLock protocol rejections are not followed by an expensive immediate BLE reconnect; transport/connect failures remain retryable.
+Example recovery flow:
 
+```text
+Lock A
+    ↓
+0x47 rejected
+    ↓
+requeue at end
+    ↓
+other jobs processed
+    ↓
+Lock A recovery
+    ↓
+SUCCESS
+```
 
-## Safe multi-lock webhook handling (v4)
+---
 
-Each `GET /api/unlock` request is authenticated, decrypted and enqueued independently and receives its own immediate HTTP 202 response/request ID. The ESP32 NimBLE host has one BLE radio owner: unlock jobs are executed serially by a single worker. This is intentional; concurrent GAP connection attempts caused `Already attempting to connect`, `Unable to scan - connection in progress`, connection failures, and eventually a Load access fault. Multiple locks from one UniFi reader are therefore safe: both webhooks are accepted immediately, then lock A and lock B are unlocked in queue order. The v2 early-stop 350 ms target scan, direct-MAC fallback, per-MAC GATT cache, CRC validation, and protocol-rejection handling are retained.
+# Disclaimer
 
+This project is not affiliated with or endorsed by Ubiquiti, UniFi,
+TTLock, Sciener, or their respective manufacturers.
 
-## v7 unlock latency tuning
+TTLock BLE behavior is based on publicly available reverse-engineering
+work and testing with the target locks. Different TTLock/OEM firmware
+versions may behave differently.
 
-- Normal webhook unlock attempt 1 connects directly by MAC with no foreground scan.
-- NimBLE automatic retries after connection-establishment error `0x3e` are disabled (`setConnectRetries(0)`).
-- Fast attempt timeout: 1800 ms.
-- Recovery attempt: 350 ms targeted scan, then connect with a 2500 ms timeout.
-- Existing per-lock GATT cache is preserved across ordinary GAP connection failures.
-- The single BLE worker remains in place; separate webhook GET requests are acknowledged and queued independently.
-
-
-## V7.1 queue retry
-
-V7.1 keeps the V7 BLE fast/recovery policy unchanged. If both normal V7 attempts fail, the unlock job is moved to the end of the worker queue once. Other waiting locks are serviced first. When the failed job returns, it performs one recovery-only attempt (targeted scan + recovery connect), then succeeds or fails permanently. If no other lock is waiting, a 500 ms cooldown is used before the final recovery attempt.
-
-
-## V7.8 BLE connection strategy
-
-V7.8 returns to the reliable V7.1 TTLock/GATT protocol path and changes only BLE discovery synchronization. A dedicated diagnostic run proved the two 5A01 locks advertise service `0x1910` with their configured public MAC addresses approximately every 900 ms.
-
-The bridge now keeps one continuous diagnostic-style NimBLE scanner running: active scan, interval/window 100/100, duplicate callbacks enabled, `onResult()` callbacks, and `maxResults(0)`. It caches plain sighting metadata only; no `NimBLEAdvertisedDevice*` is retained. Before an unlock, the worker accepts a sighting no older than 1200 ms or waits up to 1500 ms, stops the scanner, connects directly to the known public MAC, runs the existing V3 `0x55` / `0x47` flow, disconnects, and resumes scanning.
-
-The existing end-of-queue deferred retry behavior remains enabled.
-
-
-## V7.8 changes
-
-- Suppresses NimBLE INFO scan spam by using `CORE_DEBUG_LEVEL=1`.
-- Scanner callbacks only cache TTLock advertisements carrying service `0x1910`; unrelated devices are ignored by bridge logic.
-- A configured lock sighting is reusable for 10 seconds. This avoids the v7.6 back-to-back-lock bug where the second lock's sighting expired while the first ~1.3 second unlock was running.
-- If there is no usable cached sighting, waits up to 1.2 seconds for the next TTLock advertisement.
-- Existing queue, end-of-queue retry, GATT cache and TTLock `0x55 -> 0x47` protocol are retained.
-
-Note: BLE scanning is radio-wide; NimBLE cannot make the controller physically receive only arbitrary configured MAC addresses. V7.8 filters them immediately in software and suppresses NimBLE's per-device INFO output.
-
-
-## V7.9 reliable queue
-
-V7.9 keeps the V7.8 burst handoff and adds reliability safeguards discovered
-from field logs:
-
-- checks system time before opening BLE; requests wait/requeue while SNTP is not ready;
-- failed/rejected unlock requests are moved to the end of the queue for up to five
-  deferred recovery rounds instead of being dropped after one deferred attempt;
-- other queued doors retain priority, so one difficult lock does not block the queue;
-- successful V7.8 fast/cached paths are unchanged.
+Always retain a safe mechanical/emergency method of opening doors and
+comply with applicable building, fire-safety, insurance and
+access-control requirements.
